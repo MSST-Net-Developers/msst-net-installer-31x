@@ -72,12 +72,30 @@ jobs:
           draft: true
           files: ${{ matrix.asset_name }}
 
+  # One license file covers every platform (about.toml lists the targets).
+  # It fails if a dependency's license is not in about.toml's accepted list.
+  licenses:
+    name: Third-party licenses
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - run: cargo about generate --locked --fail about.hbs -o THIRD-PARTY-LICENSES.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: THIRD-PARTY-LICENSES.txt
+
   # The build jobs fill a draft release; publish it only when every platform
   # built, so a half-filled release is never public.  (A draft is invisible
   # to the Gitee sync, which therefore runs after this.)
   publish:
     name: Publish the release
-    needs: [build]
+    needs: [build, licenses]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
