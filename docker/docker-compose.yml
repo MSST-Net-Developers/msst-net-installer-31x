@@ -1,0 +1,54 @@
+# MSST-Net 3.1 on Docker — managed by msst-net-installer (repair rewrites
+# this file).  Images are set in .env; see controller docs/DOCKER.md.
+#
+# Core and the WebUI Controller share ./run (Core's IPC socket directory);
+# ./data is Core's volume (device identity, core.toml) and ./webui the
+# WebUI's (password hash, config.toml, TLS certificate) — both survive
+# upgrades and uninstalls.
+
+services:
+  msst-net-core:
+    image: ${MSST_CORE_IMAGE:?set in .env}
+    container_name: msst-net-core
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      CORE_MODE: container
+      # Core 3.1 listens on ipc.sock in this path's directory (/run/msst).
+      CORE_SOCKET_PATH: /run/msst/core.sock
+    volumes:
+      - ./data:/var/lib/msst
+      - ./run:/run/msst
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/msst/ipc.sock"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  msst-net-ctrl-webui:
+    image: ${MSST_WEBUI_IMAGE:?set in .env}
+    container_name: msst-net-ctrl-webui
+    restart: unless-stopped
+    depends_on:
+      msst-net-core:
+        condition: service_healthy
+    # Host networking: the IP allowlist sees real client addresses.
+    network_mode: host
+    # Root, like Core: Core gives admin access to root peers.  Rootless
+    # Docker and user-namespace remapping are not supported.
+    user: "0"
+    environment:
+      CORE_SOCKET: /run/msst/core.sock
+      WEBUI_BIND: ${MSST_WEBUI_BIND:-0.0.0.0:18080}
+      # First-start password (./secrets/admin_password, removed by the
+      # installer once ./webui/passwd exists).
+      PASSWORD_FILE: /run/secrets/admin_password
+    volumes:
+      - ./run:/run/msst
+      - ./webui:/var/lib/msst-webui
+      - ./secrets:/run/secrets:ro

@@ -1,0 +1,41 @@
+[package]
+name = "msst-net-installer"
+version = "3.1.0-alpha.1"
+edition = "2024"
+description = "MSST-Net 3.1.x installer — native and Docker deployment, migration from 3.0.x."
+license = "MIT"
+
+[[bin]]
+name = "msst-net-installer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+base64 = "0.22"
+hex = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+dialoguer = "0.11"
+console = "0.15"
+indicatif = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

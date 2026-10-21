@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
+  build:
+    name: Build (${{ matrix.asset_name }})
+    needs: [test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,  use_cross: true,  asset_name: msst-net-installer-linux-x86_64 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest,  use_cross: true,  asset_name: msst-net-installer-linux-aarch64 }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest, use_cross: false, asset_name: msst-net-installer-windows-x86_64.exe }
+          - { target: aarch64-pc-windows-msvc,    os: windows-latest, use_cross: false, asset_name: msst-net-installer-windows-aarch64.exe }
+          - { target: x86_64-apple-darwin,        os: macos-latest,   use_cross: false, asset_name: msst-net-installer-macos-x86_64 }
+          - { target: aarch64-apple-darwin,       os: macos-latest,   use_cross: false, asset_name: msst-net-installer-macos-aarch64 }
+    env:
+      # Public keys of the Core and Controller repositories' release signing
+      # keys (one each), built into the installer.
+      MSST_CORE_RELEASE_PUBKEYS: ${{ vars.MSST_CORE_RELEASE_PUBKEYS }}
+      MSST_CONTROLLER_RELEASE_PUBKEYS: ${{ vars.MSST_CONTROLLER_RELEASE_PUBKEYS }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require the release public keys
+        shell: bash
+        run: |
+          for v in MSST_CORE_RELEASE_PUBKEYS MSST_CONTROLLER_RELEASE_PUBKEYS; do
+            test -n "${!v}" || { echo "set the $v repository variable" >&2; exit 1; }
+          done
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        if: matrix.use_cross
+        with:
+          tool: cross
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --locked --release --target ${{ matrix.target }}
+      - name: Build (cargo)
+        if: '!matrix.use_cross'
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: cp "target/${{ matrix.target }}/release/msst-net-installer" "${{ matrix.asset_name }}"
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "target/${{ matrix.target }}/release/msst-net-installer.exe" "${{ matrix.asset_name }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: ${{ matrix.asset_name }}
+
+  sync-gitee:
+    name: Sync GitHub Release to Gitee
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: trustedinster/sync-release-gitee@v1.3
+        with:
+          gitee_owner: Abjust
+          gitee_repo: msst-net-installer-31x
+          gitee_token: ${{ secrets.GITEE_TOKEN }}
+          github_owner: MSST-Net-Developers
+          github_repo: msst-net-installer-31x
+          gitee_upload_retry_times: 3
