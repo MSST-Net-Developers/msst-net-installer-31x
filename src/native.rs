@@ -340,6 +340,9 @@ fn commit_version(layout: &Layout, staging: &Path, version: &str) -> Result<()> 
         }
         return Err(e).context("无法移动到版本目录");
     }
+    // The staging directory is private while downloads are unverified; the
+    // version directory must be traversable by the unprivileged WebUI user.
+    fsutil::set_mode(&dest, 0o755)?;
     if had {
         let _ = fsutil::remove_any(&aside);
     }
@@ -756,6 +759,7 @@ pub fn repair(ctx: &Ctx, state: InstallState) -> Result<()> {
     service::stop(ctx.os, Service::Core);
     let vdir = ctx.layout.version_dir(&id);
     std::fs::create_dir_all(&vdir)?;
+    fsutil::set_mode(&vdir, 0o755)?;
     for b in &broken {
         let (staged, executable) = match b {
             Broken::Artifact(_, a, _) => (staging.join(&a.name), a.format == Format::Binary),
@@ -999,6 +1003,26 @@ pub fn status(ctx: &Ctx, state: Option<&InstallState>) {
     for l in layout::data_locations(ctx.os, &ctx.home) {
         if l.path.exists() {
             ctx.ui.info(&format!("{}：{}", l.label, l.path.display()));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn committed_version_dir_is_traversable() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout { os: Os::Linux, root: d.path().into() };
+        for _ in 0..2 {
+            let staging = d.path().join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            fsutil::set_mode(&staging, 0o700).unwrap();
+            commit_version(&layout, &staging, "3.1.0+3.1.1").unwrap();
+            let mode = std::fs::metadata(layout.version_dir("3.1.0+3.1.1")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
         }
     }
 }
