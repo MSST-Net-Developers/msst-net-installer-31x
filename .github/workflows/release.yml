@@ -91,8 +91,8 @@ jobs:
           files: THIRD-PARTY-LICENSES.txt
 
   # The build jobs fill a draft release; publish it only when every platform
-  # built, so a half-filled release is never public.  (A draft is invisible
-  # to the Gitee sync, which therefore runs after this.)
+  # built, so a half-filled release is never public.  The Gitee sync runs
+  # after this, so Gitee never gets a half-filled release either.
   publish:
     name: Publish the release
     needs: [build, licenses]
@@ -108,17 +108,55 @@ jobs:
           case "$TAG" in *-*) prerelease=true ;; esac
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=$prerelease
 
+  # Mirror only this run's release to Gitee: create it there if missing and
+  # upload the assets it lacks, so a re-run is safe.
   sync-gitee:
-    name: Sync GitHub Release to Gitee
+    name: Sync the release to Gitee
     needs: [publish]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_API: https://gitee.com/api/v5/repos/Abjust/msst-net-installer-31x
+      TAG: ${{ github.ref_name }}
     steps:
-      - uses: trustedinster/sync-release-gitee@v1.3
-        with:
-          gitee_owner: Abjust
-          gitee_repo: msst-net-installer-31x
-          gitee_token: ${{ secrets.GITEE_TOKEN }}
-          github_owner: MSST-Net-Developers
-          github_repo: msst-net-installer-31x
-          gitee_upload_retry_times: 3
+      - name: Sync
+        run: |
+          set -euo pipefail
+          test -n "$GITEE_TOKEN" || { echo "set the GITEE_TOKEN secret" >&2; exit 1; }
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json name,body,targetCommitish,isPrerelease > github.json
+          mkdir assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+
+          # A missing release answers 404 (or null), so look for an id.
+          curl -sS -G "$GITEE_API/releases/tags/$TAG" --data-urlencode "access_token=$GITEE_TOKEN" > gitee.json
+          id=$(jq -r '.id? // empty' gitee.json)
+          if [ -z "$id" ]; then
+            echo "Creating Gitee release $TAG"
+            body=$(jq -r '.body // ""' github.json)
+            curl -fsS -X POST "$GITEE_API/releases" \
+              --data-urlencode "access_token=$GITEE_TOKEN" \
+              --data-urlencode "tag_name=$TAG" \
+              --data-urlencode "name=$(jq -r '.name // ""' github.json | grep . || echo "$TAG")" \
+              --data-urlencode "body=${body:--}" \
+              --data-urlencode "target_commitish=$(jq -r .targetCommitish github.json)" \
+              --data-urlencode "prerelease=$(jq -r .isPrerelease github.json)" > gitee.json
+            id=$(jq -r .id gitee.json)
+          fi
+
+          for f in assets/*; do
+            name=$(basename "$f")
+            if jq -e --arg n "$name" 'any(.assets[]?; .name == $n)' gitee.json > /dev/null; then
+              echo "$name is already on Gitee"
+              continue
+            fi
+            echo "Uploading $name"
+            for attempt in 1 2 3 4; do
+              curl -fsS -X POST "$GITEE_API/releases/$id/attach_files" \
+                -F "access_token=$GITEE_TOKEN" -F "file=@$f" > /dev/null && break
+              [ "$attempt" -lt 4 ] || { echo "uploading $name failed" >&2; exit 1; }
+              sleep 5
+            done
+          done
