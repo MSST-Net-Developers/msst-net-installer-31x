@@ -179,9 +179,13 @@ pub fn parse_asset_name(name: &str) -> Option<(Component, Os, Arch, Format)> {
 }
 
 impl Manifest {
-    /// The image to run for this release.
+    /// The image to run for this release.  An empty `image` (CI passing an
+    /// unset variable, e.g. Core 3.1.0's manifest) means the default.
     pub fn image(&self) -> String {
-        self.image.clone().unwrap_or_else(|| self.product.default_image(&self.version))
+        match self.image.as_deref().map(str::trim) {
+            Some(i) if !i.is_empty() => i.to_string(),
+            _ => self.product.default_image(&self.version),
+        }
     }
 
     pub fn find(&self, component: Component, os: Os, arch: Arch, format: Format) -> Option<&Artifact> {
@@ -478,6 +482,9 @@ pub mod tests {
         let bytes = serde_json::to_vec(&m).unwrap();
         assert!(verify(Product::Controller, &bytes, None, &lax).is_err(), "the Controller doesn't ship Core");
         assert_eq!(sample("3.1.0").image(), "abjust/msstnet31x-core:3.1.0");
+        let mut m = sample("3.1.0");
+        m.image = Some(String::new());
+        assert_eq!(m.image(), "abjust/msstnet31x-core:3.1.0", "an empty image means the default");
     }
 
     #[test]

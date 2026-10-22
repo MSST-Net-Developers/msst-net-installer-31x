@@ -71,7 +71,7 @@ pub fn generate(product: Product, dir: &Path, version: &str, extra: Extra) -> Re
         min_core: extra.min_core,
         min_installer: extra.min_installer,
         artifacts,
-        image: extra.image,
+        image: extra.image.filter(|i| !i.trim().is_empty()),
     };
     m.validate()?;
     let mut bytes = serde_json::to_vec_pretty(&m)?;
