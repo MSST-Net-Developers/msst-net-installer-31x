@@ -1,0 +1,32 @@
+# MSST-Net 3.1 on Docker, Core only — managed by msst-net-installer (repair
+# rewrites this file).  The command-line Controller (msst-net-cli) runs on
+# the host and connects to ./run/ipc.sock; Core in the container admits root
+# only (sudo msst-net-cli).  The image is set in .env; see controller
+# docs/DOCKER.md.
+#
+# ./data is Core's volume (device identity, core.toml); it survives upgrades
+# and uninstalls.
+
+services:
+  msst-net-core:
+    image: ${MSST_CORE_IMAGE:?set in .env}
+    container_name: msst-net-core
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      CORE_MODE: container
+      # Core 3.1 listens on ipc.sock in this path's directory (/run/msst).
+      CORE_SOCKET_PATH: /run/msst/core.sock
+    volumes:
+      - ./data:/var/lib/msst
+      - ./run:/run/msst
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/msst/ipc.sock"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

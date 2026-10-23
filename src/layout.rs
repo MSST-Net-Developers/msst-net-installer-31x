@@ -6,7 +6,8 @@
 //! <root>/                     /opt/msst-net, /usr/local/msst-net, %ProgramFiles%\MSST-Net
 //!   installer-state.json      what is installed (see state.rs)
 //!   .lock                     held while the installer runs
-//!   versions/<version>/       msst-net-core, msst-net-webui, wintun.dll, manifest.json(.sig)
+//!   versions/<version>/       msst-net-core, msst-net-webui | msst-net-cli, wintun.dll, manifest.json(.sig)
+//!   bin/                      Windows: msst-net-cli.exe (copy of the current version's; on PATH)
 //!   staging/<stamp>/          downloads in progress — never referenced by a service
 //!   desktop/<version>/        desktop Controller (tar.gz distributable only)
 //!   backups/<stamp>-<label>/  3.0.x files and data snapshots taken before migration
@@ -71,6 +72,34 @@ impl Layout {
 
     pub fn webui_exe(&self, version: &str) -> PathBuf {
         self.version_dir(version).join(format!("msst-net-webui{}", self.os.exe_suffix()))
+    }
+
+    pub fn cli_exe(&self, version: &str) -> PathBuf {
+        self.version_dir(version).join(format!("msst-net-cli{}", self.os.exe_suffix()))
+    }
+
+    /// The `msst-net-cli` command users run: a symlink in `/usr/local/bin`
+    /// (a wrapper script for Docker), or on Windows a copy in `<root>\bin`,
+    /// which is on the system `PATH`.  `MSST_CLI_ENTRY` overrides it (tests).
+    pub fn cli_entry(&self) -> PathBuf {
+        if let Some(p) = std::env::var_os("MSST_CLI_ENTRY") {
+            return PathBuf::from(p);
+        }
+        match self.os {
+            Os::Windows => self.bin_dir().join("msst-net-cli.exe"),
+            _ => PathBuf::from("/usr/local/bin/msst-net-cli"),
+        }
+    }
+
+    /// Windows: the directory added to the system `PATH`.
+    pub fn bin_dir(&self) -> PathBuf {
+        self.root.join("bin")
+    }
+
+    /// Docker deployment with the command-line Controller: the CLI runs on
+    /// the host, kept per Controller version (current and previous).
+    pub fn docker_cli_dir(&self, controller_version: &str) -> PathBuf {
+        self.docker_dir().join("cli").join(controller_version)
     }
 
     pub fn docker_dir(&self) -> PathBuf {
@@ -157,5 +186,6 @@ mod tests {
         assert_eq!(l.core_exe("3.1.0"), PathBuf::from("R").join("versions").join("3.1.0").join("msst-net-core.exe"));
         let l = Layout { os: Os::Linux, root: PathBuf::from("/opt/msst-net") };
         assert_eq!(l.webui_exe("3.1.0"), PathBuf::from("/opt/msst-net/versions/3.1.0/msst-net-webui"));
+        assert_eq!(l.cli_exe("3.1.0+3.1.8"), PathBuf::from("/opt/msst-net/versions/3.1.0+3.1.8/msst-net-cli"));
     }
 }

@@ -17,19 +17,24 @@ Controller 仓库）与安装器之间的契约。安装器中的 `manifest.rs`�
                               │ 角色由 Core 按对端身份判定：
                               │   admin = root/SYSTEM/管理员/msst-net 组成员
                               │   viewer = 其他已登录用户（只读）
-          ┌───────────────────┼──────────────────────────┐
-          │                   │                          │
- 桌面控制器（Compose Desktop） msst-net-webui           Android（内置 Core，不经安装器）
- 普通用户运行，JNI → IPC       系统服务，用户 msst-webui
+          ┌───────────────────┼──────────────────┬───────────────────────┐
+          │                   │                  │                       │
+ 桌面控制器（Compose Desktop） msst-net-webui     msst-net-cli            Android（内置 Core，不经安装器）
+ 普通用户运行，JNI → IPC       系统服务，用户      普通用户在终端
+                              msst-webui         中运行，IPC
                               （主组 msst-net → admin）
 ```
 
 - Core 是唯一的网络状态来源；控制器只通过 IPC 请求操作（Core `AGENTS.md`）。
-- 控制器三选一：桌面版、WebUI、不安装（仅 Core）。3.0.x 的 Tauri 控制器由
-  Compose Desktop 取代；3.0.x 的 CLI 控制器在 3.1 中没有对应的交互式程序
-  （`msst-net-controller` 目前只是连接并记录日志），因此不再提供。
-- WebUI 可选 Docker 部署（仅 Linux）：Core 与 WebUI 均以容器运行，共享
-  IPC socket 目录（controller `docs/DOCKER.md`）。
+- 控制器四选一：桌面版、WebUI、命令行（`msst-net-cli`）、不安装（仅 Core）。
+  选“仅 Core”时不安装任何控制器，CLI 也不装。3.0.x 的 Tauri 控制器由
+  Compose Desktop 取代。
+- 命令行控制器 `msst-net-cli` 由普通用户在终端中运行，经 IPC 连接 Core，不是服务；
+  适合没有图形界面、又不需要远程管理的设备。权限与桌面控制器相同。
+- WebUI 与命令行控制器可选 Docker 部署（仅 Linux）：
+  - WebUI：Core 与 WebUI 均以容器运行，共享 IPC socket 目录（controller `docs/DOCKER.md`）；
+  - 命令行：只有 Core 以容器运行，`msst-net-cli` 装在主机上，经 `run/ipc.sock` 连接。
+    容器中的 Core 不认识主机的用户与组，只接受 root 的连接，所以要用 `sudo msst-net-cli`。
 - Core 与控制器是两个开源仓库，各自发布、各自定版本号。安装器分别从两个仓库
   的 Release 下载，把（Core 版本，控制器版本）作为一个整体安装、保留与回滚
   （`versions/<core>+<controller>/`）。
@@ -54,6 +59,7 @@ Tag 为 `v<版本>`。每个 Release 只包含本仓库的产物与本仓库的�
 |---|---|---|
 | Core（core 仓库） | `msst-net-core-<os>-<arch>[.exe]` | core 仓库 `cargo build --release --bin msst-net-core` |
 | WebUI（controller 仓库） | `msst-net-webui-<os>-<arch>[.exe]` | controller 仓库 `--features webui --bin msst-net-webui`（先构建 wasm 前端） |
+| 命令行控制器（controller 仓库） | `msst-net-cli-<os>-<arch>[.exe]` | controller 仓库 `cargo build --release --bin msst-net-cli`（六个平台；Linux 为 musl 静态链接） |
 | 桌面控制器（controller 仓库） | `msst-net-controller-desktop-linux-<arch>.deb` / `.rpm` / `.tar.gz` | `packageReleaseDeb` / `packageReleaseRpm` / `createReleaseDistributable` 打包为 tar.gz |
 | | `msst-net-controller-desktop-windows-<arch>.msi` | `packageReleaseMsi` |
 | | `msst-net-controller-desktop-macos-<arch>.dmg` | `packageReleaseDmg`（**当前 build.gradle.kts 未配置**） |
@@ -83,7 +89,11 @@ Tag 为 `v<版本>`。每个 Release 只包含本仓库的产物与本仓库的�
 ```
 
 - `product`：`msst-net-core` 或 `msst-net-controller`；Core 清单只能列 core/wintun，
-  控制器清单只能列 webui/desktop。用一个仓库的签名清单冒充另一个仓库的会被拒绝。
+  控制器清单只能列 webui/desktop/cli（cli 的 `format` 只能是 `binary`）。用一个仓库的
+  签名清单冒充另一个仓库的会被拒绝。
+- 安装器不认识的 `component`（以后新增的组件）会被跳过，不会让整份清单失败。
+  3.1.4 之前的安装器会拒绝含 `cli` 的清单，所以列出 `cli` 的控制器 Release 应把
+  `min_installer` 设为 `3.1.4` 或更新。
 - `min_core`（仅控制器）：所需的最低 Core 版本，不满足时安装器拒绝。
   `ipc_protocol` 两边不同时只给出警告。
 - `image`：本发布的容器镜像，可省略；默认 `abjust/msstnet31x-core:<Core 版本>`
@@ -125,12 +135,21 @@ GitHub 的 `releases/latest` 不含预发布版本；安装 alpha/beta 需 `--ve
 | Core 数据（root/SYSTEM） | 3.0.x 目录 `~/MSST-Net`（有 identity.json 时），否则 `~/.local/share/msst-net` | `~/MSST-Net` 或 `~/Library/Application Support/msst-net` | `systemprofile\MSST-Net` 或 `systemprofile\AppData\Roaming\msst-net` |
 | Core 配置 | `~/.config/msst-net/core.toml` | 与数据目录相同 | 与数据目录相同 |
 | WebUI 配置 | `/var/lib/msst-net-webui` | `/Library/Application Support/MSST-Net/webui` | `%ProgramData%\MSST-Net\webui`（仅 SYSTEM 与管理员可访问；日志 `webui.log`） |
-| Docker | `/opt/msst-net-docker`（`data/` `webui/` `run/`） | 不支持 | 不支持 |
+| `msst-net-cli` | `<根>/versions/<版本>/msst-net-cli` | 同左 | `<根>\versions\<版本>\msst-net-cli.exe` |
+| CLI 命令入口 | 符号链接 `/usr/local/bin/msst-net-cli` → 当前版本 | 同左 | `<根>\bin\msst-net-cli.exe`（切换版本时复制），`<根>\bin` 加入系统 `PATH` |
+| Docker | `/opt/msst-net-docker`（`data/` `webui/` `run/`；命令行控制器：`cli/<控制器版本>/`） | 不支持 | 不支持 |
 
 原生安装改为 Docker 部署时（3.0.x 原生安装，或已卸载的 3.1 原生安装），设备身份
 （Core 实际使用的数据目录）复制到 `data/`，设备保持不变；3.0.x 的程序文件与服务
 定义先移入备份，Docker 部署失败时自动还原。3.1 原生 `core.toml` 不自动迁移
 （其中可能有只适用于本机的路径），会提示手动写入 `data/core.toml`。
+
+- 升级与回滚时，CLI 命令入口和服务定义一起切换到新版本（§6 第 5 步）。控制器之间
+  互相切换时（例如从 CLI 改为 WebUI），原控制器连同它的命令入口一起移除。
+- Docker + 命令行控制器：`/usr/local/bin/msst-net-cli` 是安装器管理的脚本，设置
+  `MSST_IPC_PATH=/opt/msst-net-docker/run/ipc.sock` 后运行 `cli/<控制器版本>/msst-net-cli`。
+  非 root 用户连接不上时，脚本会提示改用 sudo。`docker-compose.yml` 改用只含 Core 的模板。
+- `/usr/local/bin/msst-net-cli` 已存在但不是安装器创建的时，安装器在改动任何内容之前拒绝继续。
 
 `~` 为服务账户的主目录（root：`/root`、`/var/root`）。数据路径完全沿用 Core
 3.1 自己的解析规则（`config.rs`），安装器不改变它们，只负责备份与保留。
@@ -163,12 +182,14 @@ GitHub 的 `releases/latest` 不含预发布版本；安装 alpha/beta 需 `--ve
 
 1. 解析发布、验证清单签名。
 2. 全部产物下载到 `<根>/staging/<时间戳>/`，逐一校验大小与 SHA-256，并运行
-   `msst-net-core --version` 自检。**此前不触碰已安装的任何内容。**
+   `msst-net-core --version` 自检（选择 WebUI / CLI 时，同样检查 `msst-net-webui` /
+   `msst-net-cli --version` 的输出是否包含控制器版本号）。**此前不触碰已安装的任何内容。**
 3. （3.0.x 迁移）将 Core 数据、配置目录复制到 `<根>/backups/<时间戳>-3.0.x/`，
    停止 3.0.x，将 3.0.x 程序文件、Tauri 启动脚本**移入**备份。
 4. 暂存目录原子改名为 `versions/<版本>/`；状态文件标记 `pending`。
 5. 重写服务定义、启动、健康检查（服务持续运行 3 秒以上且 IPC 可连接；WebUI
-   通过 `msst-net-webui healthcheck`）。
+   通过 `msst-net-webui healthcheck`）。CLI 不是服务，只检查 Core；Core 通过后再切换
+   CLI 命令入口，失败回滚时入口随上一版本一起恢复。
 6. 失败：切回上一版本 / 还原 3.0.x / 移除新服务；成功：提交状态，保留当前与
    上一版本，删除更旧的版本。
 
@@ -177,7 +198,8 @@ GitHub 的 `releases/latest` 不含预发布版本；安装 alpha/beta 需 `--ve
 
 ## 7. 卸载
 
-默认保留：Core 数据与配置（设备身份）、WebUI 配置、`backups/`、管理员组；
+总是删除 CLI 命令入口（Linux/macOS 的符号链接或脚本；Windows 的 `<根>\bin` 及其
+`PATH` 条目）。默认保留：Core 数据与配置（设备身份）、WebUI 配置、`backups/`、管理员组；
 Docker 保留 `data/` 与 `webui/`。重新安装后设备仍是同一台设备。
 `--purge` 删除以上全部（交互模式需输入 `purge` 确认）。
 
@@ -187,6 +209,8 @@ Docker 保留 `data/` 与 `webui/`。重新安装后设备仍是同一台设备�
 msst-net-installer install --controller webui --admin-user alice \
     --admin-password-file /root/pw --mirror gitee --yes --non-interactive
 msst-net-installer install --controller webui --docker --admin-password-file /root/pw --yes
+msst-net-installer install --controller cli --admin-user alice --yes --non-interactive
+msst-net-installer install --controller cli --docker --yes   # Core 在容器中，sudo msst-net-cli
 msst-net-installer upgrade --core-version 3.1.2 --controller-version 3.1.1 --yes
 msst-net-installer repair --yes
 msst-net-installer rollback --yes            # 上一版本；--legacy 还原 3.0.x

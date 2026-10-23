@@ -68,7 +68,7 @@ impl Product {
     pub fn owns(self, c: Component) -> bool {
         match self {
             Product::Core => matches!(c, Component::Core | Component::Wintun),
-            Product::Controller => matches!(c, Component::Webui | Component::Desktop),
+            Product::Controller => matches!(c, Component::Webui | Component::Desktop | Component::Cli),
         }
     }
 
@@ -92,11 +92,13 @@ pub struct Artifact {
     pub sha256: String,
 }
 
-/// The two images of a Docker deployment.
+/// The images of a Docker deployment: Core, and the WebUI unless the
+/// command-line Controller (on the host) was chosen instead.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Images {
     pub core: String,
-    pub webui: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webui: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +107,14 @@ pub enum Component {
     Core,
     Webui,
     Desktop,
+    /// Command-line Controller `msst-net-cli`.
+    Cli,
     Wintun,
+    /// A component added after this installer was built: listed in a
+    /// manifest, never installed (so a new component doesn't make older
+    /// installers reject the whole release).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +128,9 @@ pub enum Format {
     #[serde(rename = "tar.gz")]
     TarGz,
     Dll,
+    /// See [`Component::Unknown`].
+    #[serde(other)]
+    Unknown,
 }
 
 impl Format {
@@ -131,6 +143,7 @@ impl Format {
             Format::Dmg => ".dmg",
             Format::TarGz => ".tar.gz",
             Format::Dll => ".dll",
+            Format::Unknown => "",
         }
     }
 }
@@ -141,7 +154,9 @@ impl Component {
             Component::Core => "msst-net-core",
             Component::Webui => "msst-net-webui",
             Component::Desktop => "msst-net-controller-desktop",
+            Component::Cli => "msst-net-cli",
             Component::Wintun => "wintun",
+            Component::Unknown => "",
         }
     }
 }
@@ -158,16 +173,17 @@ pub fn asset_name(component: Component, os: Os, arch: Arch, format: Format) -> S
 pub fn parse_asset_name(name: &str) -> Option<(Component, Os, Arch, Format)> {
     // Longest stem first ("msst-net-core" is not a prefix of the others, but
     // keep the order explicit).
-    for component in [Component::Desktop, Component::Webui, Component::Core, Component::Wintun] {
+    for component in [Component::Desktop, Component::Webui, Component::Cli, Component::Core, Component::Wintun] {
         let Some(rest) = name.strip_prefix(component.stem()).and_then(|r| r.strip_prefix('-')) else { continue };
         for os in [Os::Linux, Os::Windows, Os::Macos] {
             let Some(rest) = rest.strip_prefix(os.as_str()).and_then(|r| r.strip_prefix('-')) else { continue };
             for arch in [Arch::X86_64, Arch::Aarch64] {
                 let Some(ext) = rest.strip_prefix(arch.as_str()) else { continue };
                 let formats: &[Format] = match component {
-                    Component::Core | Component::Webui => &[Format::Binary],
+                    Component::Core | Component::Webui | Component::Cli => &[Format::Binary],
                     Component::Desktop => &[Format::Deb, Format::Rpm, Format::Msi, Format::Dmg, Format::TarGz],
                     Component::Wintun => &[Format::Dll],
+                    Component::Unknown => &[],
                 };
                 if let Some(f) = formats.iter().find(|f| f.extension(os) == ext) {
                     return Some((component, os, arch, *f));
@@ -189,7 +205,7 @@ impl Manifest {
     }
 
     pub fn find(&self, component: Component, os: Os, arch: Arch, format: Format) -> Option<&Artifact> {
-        self.artifacts.iter().find(|a| a.component == component && a.os == os && a.arch == arch && a.format == format)
+        self.artifacts.iter().find(|a| a.component != Component::Unknown && a.component == component && a.os == os && a.arch == arch && a.format == format)
     }
 
     pub fn require(&self, component: Component, os: Os, arch: Arch, format: Format) -> Result<&Artifact> {
@@ -221,6 +237,10 @@ impl Manifest {
         let mut names = std::collections::HashSet::new();
         for a in &self.artifacts {
             ensure!(names.insert(a.name.as_str()), "清单中重复的文件名：{}", a.name);
+            if a.component == Component::Unknown {
+                // A newer installer's component: never used by this one.
+                continue;
+            }
             ensure!(
                 parse_asset_name(&a.name) == Some((a.component, a.os, a.arch, a.format)),
                 "清单条目与命名约定不符：{}",
@@ -425,11 +445,14 @@ pub mod tests {
             (Component::Desktop, Os::Windows, Arch::X86_64, Format::Msi),
             (Component::Desktop, Os::Macos, Arch::Aarch64, Format::Dmg),
             (Component::Wintun, Os::Windows, Arch::X86_64, Format::Dll),
+            (Component::Cli, Os::Linux, Arch::X86_64, Format::Binary),
+            (Component::Cli, Os::Windows, Arch::Aarch64, Format::Binary),
         ] {
             let name = asset_name(c, os, arch, f);
             assert_eq!(parse_asset_name(&name), Some((c, os, arch, f)), "{name}");
         }
         assert_eq!(asset_name(Component::Core, Os::Windows, Arch::X86_64, Format::Binary), "msst-net-core-windows-x86_64.exe");
+        assert_eq!(asset_name(Component::Cli, Os::Macos, Arch::Aarch64, Format::Binary), "msst-net-cli-macos-aarch64");
         assert_eq!(parse_asset_name("msst-net-core-linux-x86_64.exe"), None);
         assert_eq!(parse_asset_name("msst-net-client-core-linux-x86_64"), None, "3.0.x names are not 3.1 artifacts");
         assert_eq!(parse_asset_name("manifest.json"), None);
@@ -482,9 +505,31 @@ pub mod tests {
         let bytes = serde_json::to_vec(&m).unwrap();
         assert!(verify(Product::Controller, &bytes, None, &lax).is_err(), "the Controller doesn't ship Core");
         assert_eq!(sample("3.1.0").image(), "abjust/msstnet31x-core:3.1.0");
+
+        let mut m = sample("3.1.0");
+        m.product = Product::Controller;
+        m.artifacts[0].name = "msst-net-cli-linux-x86_64".into();
+        m.artifacts[0].component = Component::Cli;
+        assert!(verify(Product::Controller, &serde_json::to_vec(&m).unwrap(), None, &lax).is_ok(), "the Controller ships the CLI");
+        m.product = Product::Core;
+        assert!(check(&m).is_err(), "Core doesn't ship the CLI");
         let mut m = sample("3.1.0");
         m.image = Some(String::new());
         assert_eq!(m.image(), "abjust/msstnet31x-core:3.1.0", "an empty image means the default");
+    }
+
+    #[test]
+    fn unknown_components_are_skipped() {
+        let lax = TrustPolicy { core: vec![], controller: vec![], allow_unsigned: true };
+        let mut v = serde_json::to_value(sample("3.1.0")).unwrap();
+        v["artifacts"].as_array_mut().unwrap().push(serde_json::json!({
+            "name": "msst-net-tray-linux-x86_64.flatpak", "component": "tray", "os": "linux",
+            "arch": "x86_64", "format": "flatpak", "size": 1, "sha256": "00"
+        }));
+        let (m, _) = verify(Product::Core, &serde_json::to_vec(&v).unwrap(), None, &lax).unwrap();
+        assert_eq!(m.artifacts[1].component, Component::Unknown);
+        assert_eq!(m.find(Component::Unknown, Os::Linux, Arch::X86_64, Format::Unknown), None);
+        assert!(m.find(Component::Core, Os::Linux, Arch::X86_64, Format::Binary).is_some());
     }
 
     #[test]

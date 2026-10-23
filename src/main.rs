@@ -6,6 +6,7 @@
 
 mod accounts;
 mod bundle;
+mod cli_entry;
 mod cmd;
 mod context;
 mod desktop;
@@ -76,6 +77,8 @@ enum Mirror {
 enum ControllerArg {
     Desktop,
     Webui,
+    /// 命令行控制器 msst-net-cli
+    Cli,
     None,
 }
 
@@ -84,6 +87,7 @@ impl From<ControllerArg> for ControllerKind {
         match c {
             ControllerArg::Desktop => ControllerKind::Desktop,
             ControllerArg::Webui => ControllerKind::Webui,
+            ControllerArg::Cli => ControllerKind::Cli,
             ControllerArg::None => ControllerKind::None,
         }
     }
@@ -124,7 +128,7 @@ struct InstallArgs {
     /// 控制器类型
     #[arg(long, value_enum)]
     controller: Option<ControllerArg>,
-    /// 使用 Docker 部署 Core 与 WebUI（仅 Linux，需 --controller webui）
+    /// 使用 Docker 部署（仅 Linux）：Core 与 WebUI 均为容器（--controller webui），或仅 Core 为容器、命令行控制器在主机上（--controller cli）
     #[arg(long, conflicts_with = "native")]
     docker: bool,
     /// 以系统服务方式部署（默认）
@@ -160,8 +164,8 @@ struct CommonArgs {
     /// WebUI 监听地址（Docker）
     #[arg(long, value_name = "ADDR:PORT")]
     webui_bind: Option<String>,
-    /// 覆盖 Core 镜像（Docker）
-    #[arg(long, requires = "webui_image")]
+    /// 覆盖 Core 镜像（Docker；WebUI 部署需同时指定 --webui-image）
+    #[arg(long)]
     core_image: Option<String>,
     /// 覆盖 WebUI 镜像（Docker）
     #[arg(long, requires = "core_image")]
@@ -337,7 +341,8 @@ fn docker_options(c: &CommonArgs) -> Result<docker::DockerOptions> {
     Ok(docker::DockerOptions {
         core_version: c.core_version.clone(),
         controller_version: c.controller_version.clone(),
-        images: c.core_image.clone().zip(c.webui_image.clone()).map(|(core, webui)| Images { core, webui }),
+        controller: None,
+        images: c.core_image.clone().map(|core| Images { core, webui: c.webui_image.clone() }),
         webui_password: read_password(&c.admin_password_file)?,
         webui_bind: c.webui_bind.clone(),
         registry,
@@ -351,10 +356,12 @@ fn install_cmd(ctx: &Ctx, state: Option<InstallState>, a: InstallArgs) -> Result
     let docker_legacy = state.is_none() && docker::detect_legacy(&ctx.layout.docker_dir());
     let docker = a.docker || state.as_ref().is_some_and(|s| s.deployment == Deployment::Docker) || (docker_legacy && !a.native);
     if docker {
-        if a.controller.is_some_and(|c| c != ControllerArg::Webui) {
-            bail!("Docker 部署只包含 WebUI 控制器（--controller webui）");
+        if a.controller.is_some_and(|c| !matches!(c, ControllerArg::Webui | ControllerArg::Cli)) {
+            bail!("Docker 部署的控制器只能是 WebUI 或命令行（--controller webui|cli）");
         }
-        return docker::install(ctx, docker_options(&a.common)?);
+        let mut opts = docker_options(&a.common)?;
+        opts.controller = a.controller.map(Into::into);
+        return docker::install(ctx, opts);
     }
     native::install(
         ctx,
@@ -537,6 +544,7 @@ fn wizard(ctx: &mut Ctx, state: Option<InstallState>, ask_source: bool) -> Resul
         &[
             "桌面版（Compose Desktop）— 图形界面应用",
             "WebUI                    — 浏览器访问，适合服务器",
+            "命令行（msst-net-cli）    — 终端中使用，适合无图形界面的设备",
             "不安装控制器              — 仅核心",
         ],
         0,
@@ -544,17 +552,26 @@ fn wizard(ctx: &mut Ctx, state: Option<InstallState>, ask_source: bool) -> Resul
     )? {
         0 => ControllerKind::Desktop,
         1 => ControllerKind::Webui,
+        2 => ControllerKind::Cli,
         _ => ControllerKind::None,
     };
-    let use_docker = controller == ControllerKind::Webui
-        && ctx.os == Os::Linux
-        && ui.choose_yn("使用 Docker 部署？（Core 与 WebUI 均以容器运行，需已安装 Docker 与 Compose）", false)?;
+    let use_docker = ctx.os == Os::Linux
+        && match controller {
+            ControllerKind::Webui => ui.choose_yn("使用 Docker 部署？（Core 与 WebUI 均以容器运行，需已安装 Docker 与 Compose）", false)?,
+            ControllerKind::Cli => ui.choose_yn(
+                "使用 Docker 部署 Core？（Core 以容器运行，msst-net-cli 装在主机上且需以 root 运行；需已安装 Docker 与 Compose）",
+                false,
+            )?,
+            _ => false,
+        };
     if ask_source {
         pick_source(ctx)?;
     }
     let c = pick_versions(ctx, controller != ControllerKind::None)?;
     if use_docker {
-        return docker::install(ctx, docker_options(&c)?);
+        let mut opts = docker_options(&c)?;
+        opts.controller = Some(controller);
+        return docker::install(ctx, opts);
     }
     native::install(
         ctx,

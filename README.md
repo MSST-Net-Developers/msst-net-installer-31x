@@ -1,6 +1,6 @@
 # MSST-Net 3.1.x 安装程序
 
-MSST-Net 3.1.x 的命令行安装程序，支持 Linux、macOS 和 Windows（x86_64 与 aarch64）。它负责安装、升级、修复、回滚和卸载 MSST-Net 客户端：Core 服务以及可选的 WebUI 控制器或桌面控制器。WebUI 可以选择原生安装，也可以用 Docker 部署。
+MSST-Net 3.1.x 的命令行安装程序，支持 Linux、macOS 和 Windows（x86_64 与 aarch64）。它负责安装、升级、修复、回滚和卸载 MSST-Net 客户端：Core 服务以及可选的 WebUI 控制器、桌面控制器或命令行控制器（`msst-net-cli`）。WebUI 可以选择原生安装，也可以用 Docker 部署。选择命令行控制器时也可以用 Docker 部署 Core，这时 `msst-net-cli` 装在主机上，需要以 root 运行（`sudo msst-net-cli`）。
 
 **完整文档和使用教程请访问文档站：<https://msst-net.msst2031.cn>**
 

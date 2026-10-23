@@ -1,21 +1,25 @@
-//! Native deployment: Core (and optionally the WebUI) as system services.
+//! Native deployment: Core (and optionally the WebUI) as system services;
+//! the command-line Controller as a command entry (see cli_entry.rs).
 //!
 //! Every change is a transaction:
 //!
 //! 1. resolve the Core release (and the Controller release) and verify
 //!    their manifests;
 //! 2. download every artifact into a fresh staging directory and verify it
-//!    (size + SHA-256), then self-test Core (`--version`) — the running
+//!    (size + SHA-256), then self-test Core, the WebUI or the CLI
+//!    (`--version`) — the running
 //!    installation is untouched until here;
 //! 3. (3.0.x) back up data and move 3.0 program files aside;
 //! 4. move the staged files to `versions/<core>+<controller>/`, mark the
 //!    state pending;
-//! 5. point the services at the new version, start them and wait for health;
+//! 5. point the services at the new version, start them and wait for health,
+//!    then switch the `msst-net-cli` entry;
 //! 6. on failure, point them back at the previous version (or restore
 //!    3.0.x) and report; on success, commit the state and prune old
 //!    versions (current + previous are kept for rollback).
 
 use crate::accounts;
+use crate::cli_entry::{self, Target};
 use crate::bundle::{Bundle, Versions};
 use crate::context::Ctx;
 use crate::desktop;
@@ -68,9 +72,13 @@ pub fn install(ctx: &Ctx, opts: InstallOptions) -> Result<()> {
     let controller = match (opts.controller, &existing) {
         (Some(c), _) => c,
         (None, Some(s)) => s.controller,
-        (None, None) => bail!("请选择控制器（--controller desktop|webui|none）"),
+        (None, None) => bail!("请选择控制器（--controller desktop|webui|cli|none）"),
     };
     let webui = controller == ControllerKind::Webui;
+    let cli = controller == ControllerKind::Cli;
+    if cli {
+        cli_entry::check_free(&ctx.layout)?;
+    }
 
     let bundle = Bundle::resolve(ctx, opts.core_version.as_deref(), opts.controller_version.as_deref(), controller != ControllerKind::None)?;
     let versions = bundle.versions();
@@ -105,11 +113,16 @@ pub fn install(ctx: &Ctx, opts: InstallOptions) -> Result<()> {
         Some(m) if webui => Some(m.require(Component::Webui, ctx.os, ctx.arch, Format::Binary)?),
         _ => None,
     };
+    let cli_art = match ctl_m {
+        Some(m) if cli => Some(m.require(Component::Cli, ctx.os, ctx.arch, Format::Binary)?),
+        _ => None,
+    };
     let desktop_art = match ctl_m {
         Some(m) if controller == ControllerKind::Desktop => Some(desktop::select(m, ctx.os, ctx.arch)?),
         _ => None,
     };
-    let artifacts: Vec<&Artifact> = core_arts.iter().copied().chain(webui_art).collect();
+    let ctl_arts: Vec<&Artifact> = webui_art.into_iter().chain(cli_art).collect();
+    let artifacts: Vec<&Artifact> = core_arts.iter().chain(&ctl_arts).copied().collect();
 
     let admin_users = choose_admin_users(ctx, &opts.admin_users, existing.as_ref())?;
     let needs_password = webui && !layout::webui_config_dir(ctx.os).join("passwd").exists();
@@ -161,6 +174,15 @@ pub fn install(ctx: &Ctx, opts: InstallOptions) -> Result<()> {
     } else if existing.as_ref().is_some_and(|s| s.webui_service) {
         steps.push("移除 WebUI 服务（不再选择 WebUI 控制器）".into());
     }
+    if cli {
+        steps.push(format!(
+            "命令 msst-net-cli（{}）指向新版本{}",
+            ctx.layout.cli_entry().display(),
+            if ctx.os == Os::Windows { format!("；{} 加入系统 PATH", ctx.layout.bin_dir().display()) } else { String::new() }
+        ));
+    } else if existing.as_ref().is_some_and(|s| s.controller == ControllerKind::Cli) {
+        steps.push("移除命令 msst-net-cli（不再选择命令行控制器）".into());
+    }
     if let Some(a) = desktop_art {
         steps.push(format!("安装桌面控制器（{}）", a.name));
     }
@@ -184,7 +206,7 @@ pub fn install(ctx: &Ctx, opts: InstallOptions) -> Result<()> {
     // ---- stage: nothing installed is touched until this succeeds ----
     ctx.ui.section("下载与校验");
     let staging = ctx.staging()?;
-    let staged = stage(ctx, &bundle, &core_arts, webui_art, wintun.is_none(), &staging);
+    let staged = stage(ctx, &bundle, &core_arts, &ctl_arts, wintun.is_none(), &staging);
     if let Err(e) = staged {
         let _ = fsutil::remove_any(&staging);
         return Err(e.context("下载或校验失败，现有安装未做任何更改"));
@@ -223,7 +245,7 @@ pub fn install(ctx: &Ctx, opts: InstallOptions) -> Result<()> {
 
         ctx.ui.section("启动服务");
         let password_file = Some(initial_password_file(ctx.os)).filter(|p| p.exists());
-        activate(ctx, &target, webui, password_file.as_deref())?;
+        activate(ctx, &target, webui, cli, password_file.as_deref())?;
         Ok(state)
     })();
 
@@ -284,12 +306,12 @@ pub fn install(ctx: &Ctx, opts: InstallOptions) -> Result<()> {
     Ok(())
 }
 
-fn stage(ctx: &Ctx, bundle: &Bundle, core_arts: &[&Artifact], webui: Option<&Artifact>, fetch_wintun: bool, dir: &Path) -> Result<()> {
+fn stage(ctx: &Ctx, bundle: &Bundle, core_arts: &[&Artifact], ctl_arts: &[&Artifact], fetch_wintun: bool, dir: &Path) -> Result<()> {
     ctx.download(&bundle.core, core_arts, dir)?;
-    if let (Some(a), Some(rel)) = (webui, &bundle.controller) {
-        ctx.download(rel, &[a], dir)?;
+    if let Some(rel) = bundle.controller.as_ref().filter(|_| !ctl_arts.is_empty()) {
+        ctx.download(rel, ctl_arts, dir)?;
     }
-    for a in core_arts.iter().copied().chain(webui) {
+    for a in core_arts.iter().chain(ctl_arts).copied() {
         let renamed = dir.join(installed_name(a, ctx.os));
         std::fs::rename(dir.join(&a.name), &renamed)?;
         if a.format == Format::Binary {
@@ -306,9 +328,11 @@ fn stage(ctx: &Ctx, bundle: &Bundle, core_arts: &[&Artifact], webui: Option<&Art
     }
     health::preflight(&dir.join(format!("msst-net-core{}", ctx.os.exe_suffix())), &bundle.core.manifest.version)?;
     ctx.ui.success("Core 自检通过");
-    if let (Some(_), Some(ctl)) = (webui, &bundle.controller) {
-        health::preflight(&dir.join(format!("msst-net-webui{}", ctx.os.exe_suffix())), &ctl.manifest.version)?;
-        ctx.ui.success("WebUI 自检通过");
+    if let Some(ctl) = &bundle.controller {
+        for a in ctl_arts {
+            health::preflight(&dir.join(installed_name(a, ctx.os)), &ctl.manifest.version)?;
+            ctx.ui.success(&format!("{} 自检通过", if a.component == Component::Cli { "命令行控制器" } else { "WebUI" }));
+        }
     }
     Ok(())
 }
@@ -318,8 +342,9 @@ fn installed_name(a: &Artifact, os: Os) -> String {
     match a.component {
         Component::Core => format!("msst-net-core{}", os.exe_suffix()),
         Component::Webui => format!("msst-net-webui{}", os.exe_suffix()),
+        Component::Cli => format!("msst-net-cli{}", os.exe_suffix()),
         Component::Wintun => "wintun.dll".into(),
-        Component::Desktop => a.name.clone(),
+        Component::Desktop | Component::Unknown => a.name.clone(),
     }
 }
 
@@ -359,8 +384,9 @@ fn retire_legacy(ctx: &Ctx, l: &LegacyNative) -> Result<Backup> {
     Ok(b)
 }
 
-/// Point the services at `version`, start them, and wait until healthy.
-fn activate(ctx: &Ctx, version: &str, webui: bool, password_file: Option<&Path>) -> Result<()> {
+/// Point the services at `version`, start them, and wait until healthy;
+/// then point the `msst-net-cli` entry at it (or remove the entry).
+fn activate(ctx: &Ctx, version: &str, webui: bool, cli: bool, password_file: Option<&Path>) -> Result<()> {
     let os = ctx.os;
     service::stop(os, Service::Webui);
     service::stop(os, Service::Core);
@@ -378,6 +404,12 @@ fn activate(ctx: &Ctx, version: &str, webui: bool, password_file: Option<&Path>)
         ctx.ui.success("WebUI 运行正常");
     } else if service::exists(os, Service::Webui) {
         service::remove(os, Service::Webui)?;
+    }
+    if cli {
+        cli_entry::point_to(&ctx.layout, Target::Native(&ctx.layout.cli_exe(version)))?;
+        ctx.ui.success(&format!("命令 msst-net-cli 已指向 {}", ctx.layout.cli_exe(version).display()));
+    } else if cli_entry::exists(&ctx.layout) {
+        cli_entry::remove(&ctx.layout)?;
     }
     Ok(())
 }
@@ -398,7 +430,7 @@ fn recover(ctx: &Ctx, existing: Option<&InstallState>, backup: Option<&Backup>, 
     ctx.ui.section("回滚");
     let os = ctx.os;
     if let Some(s) = existing {
-        match activate(ctx, &s.version, s.webui_service, None) {
+        match activate(ctx, &s.version, s.webui_service, s.controller == ControllerKind::Cli, None) {
             Ok(()) => ctx.ui.success(&format!("已回滚到 {}", Versions::parse_id(&s.version).label())),
             Err(e) => ctx.ui.warn(&format!("回滚到 {} 也失败了：{e:#}\n    请执行「修复」。", Versions::parse_id(&s.version).label())),
         }
@@ -408,6 +440,7 @@ fn recover(ctx: &Ctx, existing: Option<&InstallState>, backup: Option<&Backup>, 
         let _ = s.save(&ctx.layout);
     } else {
         let _ = service::remove(os, Service::Webui);
+        let _ = cli_entry::remove(&ctx.layout);
         match backup {
             Some(b) => match legacy::restore_native(os, b) {
                 Ok(()) => ctx.ui.success("已还原 3.0.x 并重新启动"),
@@ -581,6 +614,12 @@ fn summary(ctx: &Ctx, state: &InstallState, backup: Option<&Backup>) {
             ctx.ui.info("WebUI：https://<本机地址>:18080（首次访问需信任自签名证书）");
         }
         ControllerKind::Desktop if state.desktop.is_some() => ctx.ui.info("桌面控制器：在应用菜单中打开「MSST-Net」"),
+        ControllerKind::Cli => {
+            ctx.ui.info(&format!("命令行控制器：msst-net-cli（{}），运行 msst-net-cli --help 查看用法", ctx.layout.cli_entry().display()));
+            if ctx.os == Os::Windows {
+                ctx.ui.info("新打开的终端中可直接运行 msst-net-cli（PATH 已更新）");
+            }
+        }
         _ => {}
     }
     if !state.admin_users.is_empty() {
@@ -633,14 +672,16 @@ fn saved_manifests(ctx: &Ctx, id: &str) -> Result<Saved> {
 }
 
 /// What `versions/<id>/` should contain, from its saved manifests.
-fn expected_files(ctx: &Ctx, id: &str, saved: &Saved, webui: bool) -> Vec<(Product, Artifact, PathBuf)> {
+fn expected_files(ctx: &Ctx, id: &str, saved: &Saved, controller: ControllerKind) -> Vec<(Product, Artifact, PathBuf)> {
     let dir = ctx.layout.version_dir(id);
     let mut wanted = vec![(Product::Core, Component::Core, Format::Binary)];
     if ctx.os == Os::Windows {
         wanted.push((Product::Core, Component::Wintun, Format::Dll));
     }
-    if webui {
-        wanted.push((Product::Controller, Component::Webui, Format::Binary));
+    match controller {
+        ControllerKind::Webui => wanted.push((Product::Controller, Component::Webui, Format::Binary)),
+        ControllerKind::Cli => wanted.push((Product::Controller, Component::Cli, Format::Binary)),
+        ControllerKind::Desktop | ControllerKind::None => {}
     }
     wanted
         .into_iter()
@@ -665,8 +706,8 @@ impl Broken {
 }
 
 /// Files of `versions/<id>/` that are missing or don't match the manifests.
-fn broken_files(ctx: &Ctx, id: &str, saved: &Saved, webui: bool) -> Vec<Broken> {
-    let mut broken: Vec<_> = expected_files(ctx, id, saved, webui)
+fn broken_files(ctx: &Ctx, id: &str, saved: &Saved, controller: ControllerKind) -> Vec<Broken> {
+    let mut broken: Vec<_> = expected_files(ctx, id, saved, controller)
         .into_iter()
         .filter(|(_, a, p)| !release::matches(p, a))
         .map(|(prod, a, p)| Broken::Artifact(prod, a, p))
@@ -683,6 +724,10 @@ pub fn repair(ctx: &Ctx, state: InstallState) -> Result<()> {
     let id = state.version.clone();
     let versions = Versions::parse_id(&id);
     let webui = state.controller == ControllerKind::Webui;
+    let cli = state.controller == ControllerKind::Cli;
+    if cli {
+        cli_entry::check_free(&ctx.layout)?;
+    }
 
     // Releases are fetched only when needed: a missing/damaged saved
     // manifest, damaged files, or a missing desktop Controller.
@@ -698,7 +743,7 @@ pub fn repair(ctx: &Ctx, state: InstallState) -> Result<()> {
             s
         }
     };
-    let broken = broken_files(ctx, &id, &saved, webui);
+    let broken = broken_files(ctx, &id, &saved, state.controller);
     let desktop_missing = state.controller == ControllerKind::Desktop && state.desktop.as_ref().is_none_or(|d| !desktop::is_installed(d));
 
     let mut steps = Vec::new();
@@ -711,6 +756,9 @@ pub fn repair(ctx: &Ctx, state: InstallState) -> Result<()> {
     }
     steps.push(format!("确保管理员组 {}{}", accounts::admin_group(ctx.os), if webui && ctx.os == Os::Linux { "与 WebUI 系统用户" } else { "" }));
     steps.push("重写服务配置，重启并做健康检查".into());
+    if cli {
+        steps.push(format!("重建命令 msst-net-cli（{}）", ctx.layout.cli_entry().display()));
+    }
     if desktop_missing {
         steps.push("重新安装桌面控制器".into());
     }
@@ -786,7 +834,7 @@ pub fn repair(ctx: &Ctx, state: InstallState) -> Result<()> {
         prepare_webui(ctx, None, None)?;
     }
     let password_file = Some(initial_password_file(ctx.os)).filter(|p| p.exists());
-    let result = activate(ctx, &id, webui, password_file.as_deref());
+    let result = activate(ctx, &id, webui, cli, password_file.as_deref());
     state.pending = None;
     state.record("repair", &id, result.is_ok(), result.as_ref().err().map(|e| format!("{e:#}")));
     state.save(&ctx.layout)?;
@@ -816,8 +864,9 @@ pub fn rollback(ctx: &Ctx, state: InstallState) -> Result<()> {
         bail!("没有可回滚的版本（只保留上一次升级前的版本）。");
     };
     let webui = state.controller == ControllerKind::Webui;
+    let cli = state.controller == ControllerKind::Cli;
     let saved = saved_manifests(ctx, &prev).with_context(|| format!("版本 {prev} 的文件不可用，无法回滚"))?;
-    let broken = broken_files(ctx, &prev, &saved, webui);
+    let broken = broken_files(ctx, &prev, &saved, state.controller);
     if !broken.is_empty() {
         bail!("版本 {prev} 的文件已损坏或缺失（{}），无法回滚", broken.iter().map(|b| b.path().display().to_string()).collect::<Vec<_>>().join("、"));
     }
@@ -830,9 +879,9 @@ pub fn rollback(ctx: &Ctx, state: InstallState) -> Result<()> {
     let current = state.version.clone();
     state.begin(&ctx.layout, "rollback", &prev)?;
     ctx.ui.section("回滚");
-    if let Err(e) = activate(ctx, &prev, webui, None) {
+    if let Err(e) = activate(ctx, &prev, webui, cli, None) {
         ctx.ui.warn(&format!("{e:#}"));
-        let back = activate(ctx, &current, webui, None);
+        let back = activate(ctx, &current, webui, cli, None);
         state.pending = None;
         state.record("rollback", &prev, false, Some(format!("{e:#}")));
         state.save(&ctx.layout)?;
@@ -854,7 +903,7 @@ pub fn rollback_legacy(ctx: &Ctx, state: InstallState) -> Result<()> {
     let dir = state.legacy_backup.clone().context("没有 3.0.x 备份（该系统不是从 3.0.x 迁移的）")?;
     let backup = Backup::open(&dir)?;
     let mut steps = vec![
-        "停止并移除 3.1 服务".into(),
+        "停止并移除 3.1 服务（及命令 msst-net-cli）".into(),
         format!("从 {} 还原 3.0.x 程序文件、服务配置与迁移前的数据快照", dir.display()),
         "启动 3.0.x 服务".into(),
         "删除 3.1 程序文件与安装记录（备份保留）".into(),
@@ -866,6 +915,7 @@ pub fn rollback_legacy(ctx: &Ctx, state: InstallState) -> Result<()> {
         return Ok(());
     }
     service::remove(ctx.os, Service::Webui)?;
+    cli_entry::remove(&ctx.layout)?;
     legacy::restore_native(ctx.os, &backup)?;
     ctx.ui.success("3.0.x 已还原并启动");
     let _ = std::fs::copy(ctx.layout.state_file(), dir.join("installer-state.3.1.json"));
@@ -880,6 +930,13 @@ pub fn uninstall(ctx: &Ctx, state: InstallState, purge: bool, keep_desktop: bool
     let mut steps = vec!["停止并移除 Core 服务".to_string()];
     if state.webui_service {
         steps.push("停止并移除 WebUI 服务".into());
+    }
+    if cli_entry::exists(&ctx.layout) {
+        steps.push(format!(
+            "删除命令 msst-net-cli（{}）{}",
+            ctx.layout.cli_entry().display(),
+            if ctx.os == Os::Windows { "，并从系统 PATH 中移除" } else { "" }
+        ));
     }
     if let Some(d) = &state.desktop
         && !keep_desktop
@@ -915,6 +972,10 @@ pub fn uninstall(ctx: &Ctx, state: InstallState, purge: bool, keep_desktop: bool
     service::remove(ctx.os, Service::Webui)?;
     service::remove(ctx.os, Service::Core)?;
     ctx.ui.success("服务已移除");
+    if state.controller == ControllerKind::Cli || cli_entry::exists(&ctx.layout) {
+        cli_entry::remove(&ctx.layout)?;
+        ctx.ui.success("命令 msst-net-cli 已删除");
+    }
     if let Some(d) = &state.desktop
         && !keep_desktop
     {
@@ -980,12 +1041,18 @@ pub fn status(ctx: &Ctx, state: Option<&InstallState>) {
                     ctx.ui.info(&format!("WebUI 服务：{}", if service::is_running(ctx.os, Service::Webui) { "运行中" } else { "未运行" }));
                 }
                 if let Ok(saved) = saved_manifests(ctx, &s.version) {
-                    let broken = broken_files(ctx, &s.version, &saved, s.controller == ControllerKind::Webui);
+                    let broken = broken_files(ctx, &s.version, &saved, s.controller);
                     if broken.is_empty() {
                         ctx.ui.info("程序文件：完整（SHA-256 一致）");
                     } else {
                         ctx.ui.warn(&format!("程序文件：{} 个损坏或缺失（请执行修复）", broken.len()));
                     }
+                }
+            }
+            if s.controller == ControllerKind::Cli {
+                match cli_entry::describe(&ctx.layout) {
+                    Some(d) => ctx.ui.info(&format!("命令 msst-net-cli：{d}")),
+                    None => ctx.ui.warn("命令 msst-net-cli 不存在（请执行修复）"),
                 }
             }
             if let Some(d) = &s.desktop {

@@ -1,11 +1,15 @@
 //! Docker deployment (Linux): Core and the WebUI Controller as two
 //! containers sharing Core's IPC socket directory (controller
-//! `docs/DOCKER.md`).  Offered when the WebUI Controller is chosen.
+//! `docs/DOCKER.md`).  Offered when the WebUI or the command-line
+//! Controller is chosen; with the latter only Core runs in a container and
+//! `msst-net-cli` runs on the host (see cli_entry.rs), connecting to
+//! `./run/ipc.sock` as root.
 //!
 //! ```text
 //! /opt/msst-net-docker/        (3.0.x's directory: ./data keeps the device identity)
-//!   docker-compose.yml         managed template; images come from .env
+//!   docker-compose.yml         managed template (Core + WebUI, or Core only); images come from .env
 //!   .env                       MSST_CORE_IMAGE / MSST_WEBUI_IMAGE / MSST_WEBUI_BIND  (0600)
+//!   cli/<controller version>/  msst-net-cli + the Controller's manifest (CLI only; current and previous)
 //!   .env.previous              the images before the last upgrade (rollback)
 //!   secrets/admin_password     first-start WebUI password, deleted once the WebUI is healthy
 //!   .docker/                   registry credentials used by the installer only (0700)
@@ -24,14 +28,17 @@
 //! keeps the device.
 
 use crate::bundle::{Bundle, Versions};
+use crate::cli_entry::{self, Target};
 use crate::cmd;
 use crate::context::Ctx;
 use crate::fsutil;
 use crate::layout;
+use crate::health;
 use crate::legacy::{self, Backup};
-use crate::service::{self, Service};
-use crate::manifest::Images;
+use crate::manifest::{self, Component, Format, Images, Product};
 use crate::platform::Os;
+use crate::release::{self, Release};
+use crate::service::{self, Service};
 use crate::state::{ControllerKind, Deployment, InstallState, Lock};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -39,12 +46,17 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const COMPOSE: &str = include_str!("../docker/docker-compose.yml");
+/// Core only (command-line Controller on the host).
+const COMPOSE_CORE: &str = include_str!("../docker/docker-compose.core.yml");
 const CORE_CONTAINER: &str = "msst-net-core";
 const WEBUI_CONTAINER: &str = "msst-net-ctrl-webui";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_BIND: &str = "0.0.0.0:18080";
 
 pub struct DockerOptions {
+    /// `Webui` or `Cli`; None: keep the installed choice (WebUI for a new
+    /// deployment).
+    pub controller: Option<ControllerKind>,
     pub core_version: Option<String>,
     pub controller_version: Option<String>,
     pub images: Option<Images>,
@@ -131,10 +143,12 @@ impl Env {
     }
 
     fn write_env(&self, images: &Images, bind: &str) -> Result<()> {
-        let text = format!(
-            "# Managed by msst-net-installer.\nMSST_CORE_IMAGE={}\nMSST_WEBUI_IMAGE={}\nMSST_WEBUI_BIND={}\n",
-            images.core, images.webui, bind
-        );
+        let mut text = format!("# Managed by msst-net-installer.\nMSST_CORE_IMAGE={}\n", images.core);
+        if let Some(w) = &images.webui {
+            text.push_str(&format!("MSST_WEBUI_IMAGE={w}\n"));
+        }
+        // Kept without the WebUI too: switching back keeps the address.
+        text.push_str(&format!("MSST_WEBUI_BIND={bind}\n"));
         fsutil::atomic_write(&self.dir.join(".env"), text.as_bytes(), 0o600)
     }
 
@@ -145,14 +159,22 @@ impl Env {
             .unwrap_or_else(|| DEFAULT_BIND.into())
     }
 
-    fn write_compose(&self) -> Result<()> {
-        for d in ["data", "run", "webui"] {
+    fn write_compose(&self, webui: bool) -> Result<()> {
+        for d in ["data", "run"] {
             std::fs::create_dir_all(self.dir.join(d))?;
         }
-        fsutil::set_mode(&self.dir.join("webui"), 0o700)?;
-        std::fs::create_dir_all(self.dir.join("secrets"))?;
-        fsutil::set_mode(&self.dir.join("secrets"), 0o700)?;
-        fsutil::atomic_write(&self.dir.join("docker-compose.yml"), COMPOSE.as_bytes(), 0o644)
+        if webui {
+            std::fs::create_dir_all(self.dir.join("webui"))?;
+            fsutil::set_mode(&self.dir.join("webui"), 0o700)?;
+            std::fs::create_dir_all(self.dir.join("secrets"))?;
+            fsutil::set_mode(&self.dir.join("secrets"), 0o700)?;
+        }
+        let template = if webui { COMPOSE } else { COMPOSE_CORE };
+        fsutil::atomic_write(&self.dir.join("docker-compose.yml"), template.as_bytes(), 0o644)
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.dir.join("run/ipc.sock")
     }
 
     fn secret_file(&self) -> PathBuf {
@@ -170,15 +192,15 @@ impl Env {
         self.dir.join("webui/passwd").exists()
     }
 
-    /// Wait until both containers run and report healthy, and Core's socket
-    /// accepts connections from the host.
-    fn wait_healthy(&self) -> Result<()> {
+    /// Wait until the containers (Core, and the WebUI if `webui`) run and
+    /// report healthy, and Core's socket accepts connections from the host.
+    fn wait_healthy(&self, webui: bool) -> Result<()> {
         let start = Instant::now();
-        let socket = self.dir.join("run/ipc.sock");
+        let socket = self.socket();
         let mut last = String::new();
         while start.elapsed() < HEALTH_TIMEOUT {
             let core = self.container_status(CORE_CONTAINER);
-            let webui = self.container_status(WEBUI_CONTAINER);
+            let webui = if webui { self.container_status(WEBUI_CONTAINER) } else { "running healthy".into() };
             if core == "running healthy" && webui == "running healthy" && socket_accepts(&socket) {
                 return Ok(());
             }
@@ -239,20 +261,99 @@ pub fn detect_legacy(dir: &Path) -> bool {
 }
 
 /// The version id and images to deploy: from the Core and Controller
-/// releases, or given explicitly (`--core-image` / `--webui-image`).
-fn images_for(ctx: &Ctx, opts: &DockerOptions) -> Result<(String, Images)> {
-    if let Some(i) = &opts.images
-        && opts.core_version.is_none()
-        && opts.controller_version.is_none()
-    {
-        return Ok(("custom".into(), i.clone()));
+/// releases, or given explicitly (`--core-image` / `--webui-image`).  With
+/// the command-line Controller the Controller release is always resolved
+/// (it carries the CLI) and returned.
+fn images_for(ctx: &Ctx, opts: &DockerOptions, cli: bool) -> Result<(String, Images, Option<Release>)> {
+    match &opts.images {
+        Some(i) if cli && i.webui.is_some() => bail!("命令行控制器不使用 WebUI 镜像（去掉 --webui-image）"),
+        Some(i) if !cli && i.webui.is_none() => bail!("WebUI 部署需同时指定 --core-image 与 --webui-image"),
+        Some(i) if !cli && opts.core_version.is_none() && opts.controller_version.is_none() => {
+            return Ok(("custom".into(), i.clone(), None));
+        }
+        _ => {}
     }
     let b = Bundle::resolve(ctx, opts.core_version.as_deref(), opts.controller_version.as_deref(), true)?;
+    let ctl = b.controller.expect("controller release");
     let images = opts.images.clone().unwrap_or_else(|| Images {
         core: b.core.manifest.image(),
-        webui: b.controller.as_ref().expect("controller release").manifest.image(),
+        webui: (!cli).then(|| ctl.manifest.image()),
     });
-    Ok((b.versions().id(), images))
+    let id = Versions { core: b.core.manifest.version.clone(), controller: Some(ctl.manifest.version.clone()) }.id();
+    Ok((id, images, cli.then_some(ctl)))
+}
+
+/// The host CLI of a Docker deployment: `cli/<controller version>/msst-net-cli`.
+fn cli_exe(ctx: &Ctx, controller_version: &str) -> PathBuf {
+    ctx.layout.docker_cli_dir(controller_version).join("msst-net-cli")
+}
+
+/// Download and self-test the CLI into a staging directory (with the
+/// Controller's manifest, for repair).  Nothing installed is touched.
+fn stage_cli(ctx: &Ctx, rel: &Release) -> Result<PathBuf> {
+    let art = rel.manifest.require(Component::Cli, ctx.os, ctx.arch, Format::Binary)?;
+    let dir = ctx.staging()?;
+    let result = (|| -> Result<()> {
+        ctx.download(rel, &[art], &dir)?;
+        let exe = dir.join("msst-net-cli");
+        std::fs::rename(dir.join(&art.name), &exe)?;
+        fsutil::set_mode(&exe, 0o755)?;
+        rel.save_manifest(&dir)?;
+        health::preflight(&exe, &rel.manifest.version)?;
+        ctx.ui.success("命令行控制器自检通过");
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = fsutil::remove_any(&dir);
+        return Err(e);
+    }
+    Ok(dir)
+}
+
+/// Move a staged CLI to `cli/<version>/` (replacing it).
+fn commit_cli(ctx: &Ctx, staged: &Path, version: &str) -> Result<()> {
+    let dest = ctx.layout.docker_cli_dir(version);
+    fsutil::remove_any(&dest)?;
+    std::fs::create_dir_all(dest.parent().expect("cli dir"))?;
+    fsutil::move_path(staged, &dest)?;
+    fsutil::set_mode(&dest, 0o755)
+}
+
+/// Point `msst-net-cli` at the CLI of `controller_version`.
+fn point_cli(ctx: &Ctx, env: &Env, controller_version: &str) -> Result<()> {
+    let exe = cli_exe(ctx, controller_version);
+    cli_entry::point_to(&ctx.layout, Target::Docker { exe: &exe, socket: &env.socket() })?;
+    ctx.ui.success(&format!("命令 msst-net-cli 已指向 {}（需以 root 运行：sudo msst-net-cli）", exe.display()));
+    Ok(())
+}
+
+/// Remove the host CLI (entry and files), e.g. after switching to the WebUI.
+fn remove_cli(ctx: &Ctx) -> Result<()> {
+    cli_entry::remove(&ctx.layout)?;
+    fsutil::remove_any(&ctx.layout.docker_dir().join("cli"))
+}
+
+/// Keep the CLI of the current and previous versions.
+fn prune_cli(ctx: &Ctx, state: &InstallState) {
+    let keep: Vec<String> =
+        [Some(&state.version), state.previous.as_ref()].into_iter().flatten().filter_map(|id| Versions::parse_id(id).controller).collect();
+    for dir in fsutil::list_dir(&ctx.layout.docker_dir().join("cli")) {
+        if !keep.contains(&fsutil::file_name(&dir)) {
+            let _ = fsutil::remove_any(&dir);
+        }
+    }
+}
+
+/// Whether the installed CLI of `controller_version` matches its saved,
+/// verified manifest.
+fn cli_intact(ctx: &Ctx, controller_version: &str) -> bool {
+    let dir = ctx.layout.docker_cli_dir(controller_version);
+    let (mname, sname) = release::saved_names(Product::Controller);
+    let Ok(bytes) = std::fs::read(dir.join(&mname)) else { return false };
+    let sig = std::fs::read(dir.join(sname)).ok();
+    let Ok((m, _)) = manifest::verify(Product::Controller, &bytes, sig.as_deref(), &ctx.trust) else { return false };
+    m.version == controller_version
+        && m.find(Component::Cli, ctx.os, ctx.arch, Format::Binary).is_some_and(|a| release::matches(&dir.join("msst-net-cli"), a))
 }
 
 /// A native data directory with a device identity that `./data` lacks.
@@ -286,9 +387,20 @@ pub fn install(ctx: &Ctx, opts: DockerOptions) -> Result<()> {
             ctx.ui.info(&d);
         }
     }
-    let (version, images) = images_for(ctx, &opts)?;
+    let controller = opts.controller.or(existing.as_ref().map(|s| s.controller)).unwrap_or(ControllerKind::Webui);
+    if !matches!(controller, ControllerKind::Webui | ControllerKind::Cli) {
+        bail!("Docker 部署的控制器只能是 WebUI 或命令行（--controller webui|cli）");
+    }
+    let (webui, cli) = (controller == ControllerKind::Webui, controller == ControllerKind::Cli);
+    if cli {
+        cli_entry::check_free(&ctx.layout)?;
+    }
+    let (version, images, cli_release) = images_for(ctx, &opts, cli)?;
+    let cli_version = cli_release.as_ref().map(|r| r.manifest.version.clone());
     if let Some(s) = &existing
-        && s.images.as_ref().is_some_and(|i| i.core == images.core && i.webui == images.webui)
+        && s.controller == controller
+        && s.images.as_ref() == Some(&images)
+        && (!cli || s.version == version)
     {
         ctx.ui.info(&format!("已在使用这些镜像（{}），无需升级。容器异常请使用「修复」。", label(&version)));
         return Ok(());
@@ -310,17 +422,22 @@ pub fn install(ctx: &Ctx, opts: DockerOptions) -> Result<()> {
     };
     let bind = opts.webui_bind.clone().unwrap_or_else(|| if existing.is_some() { env.read_bind() } else { DEFAULT_BIND.into() });
 
-    let can_import = legacy && cmd::succeeds("docker", &["inspect", WEBUI_CONTAINER]);
+    let can_import = webui && legacy && cmd::succeeds("docker", &["inspect", WEBUI_CONTAINER]);
     let password = match &opts.webui_password {
+        _ if !webui => None,
         Some(p) => Some(p.clone()),
         None if env.has_password() || can_import => None,
         None => Some(ctx.ui.new_password("设置 WebUI 访问密码", "--admin-password-file")?),
     };
 
-    let mut steps = vec![
-        format!("拉取镜像 {}", images.core),
-        format!("拉取镜像 {}（拉取失败则中止，正在运行的容器不受影响）", images.webui),
-    ];
+    let mut steps: Vec<String> =
+        [&images.core].into_iter().chain(&images.webui).map(|i| format!("拉取镜像 {i}")).collect();
+    if let Some(last) = steps.last_mut() {
+        last.push_str("（拉取失败则中止，正在运行的容器不受影响）");
+    }
+    if let Some(r) = &cli_release {
+        steps.push(format!("下载命令行控制器 {} 并校验 SHA-256、自检（在主机上运行）", r.manifest.version));
+    }
     if opts.registry.is_some() {
         steps.insert(0, format!("登录镜像仓库（凭据仅保存在 {}，权限 0700）", env.docker_config().display()));
     }
@@ -343,7 +460,20 @@ pub fn install(ctx: &Ctx, opts: DockerOptions) -> Result<()> {
         Some(s) => format!("重建容器并做健康检查；失败自动回滚到 {}", label(&s.version)),
         None => "启动容器并做健康检查".into(),
     });
-    steps.push(format!("WebUI 监听 {bind}；保留 ./data（身份）与 ./webui（密码、证书）"));
+    if webui {
+        steps.push(format!("WebUI 监听 {bind}；保留 ./data（身份）与 ./webui（密码、证书）"));
+    } else {
+        steps.push(format!(
+            "命令 msst-net-cli（{}）指向主机上的命令行控制器；Core 只接受 root 的连接（sudo msst-net-cli）",
+            ctx.layout.cli_entry().display()
+        ));
+        if existing.as_ref().is_some_and(|s| s.controller == ControllerKind::Webui) {
+            steps.push("移除 WebUI 容器（./webui 中的密码与证书保留）".into());
+        }
+    }
+    if webui && existing.as_ref().is_some_and(|s| s.controller == ControllerKind::Cli) {
+        steps.push("移除命令 msst-net-cli 与主机上的命令行控制器".into());
+    }
     if !ctx.ui.plan(&format!("Docker 部署 MSST-Net（{}）", label(&version)), &steps, ctx.dry_run)? {
         return Ok(());
     }
@@ -355,8 +485,17 @@ pub fn install(ctx: &Ctx, opts: DockerOptions) -> Result<()> {
         ctx.ui.success(&format!("已登录 {}", r.server));
     }
     env.pull(&images.core)?;
-    env.pull(&images.webui)?;
+    if let Some(w) = &images.webui {
+        env.pull(w)?;
+    }
     ctx.ui.success("镜像已拉取");
+    let cli_staged = match &cli_release {
+        Some(r) => {
+            ctx.ui.section("命令行控制器");
+            Some(stage_cli(ctx, r).context("下载或校验失败，现有部署未做任何更改")?)
+        }
+        None => None,
+    };
 
     let mut backup = None;
     let mut native_backup = None;
@@ -398,32 +537,42 @@ pub fn install(ctx: &Ctx, opts: DockerOptions) -> Result<()> {
         backup = Some(b);
     }
 
-    let mut state = existing.clone().unwrap_or_else(|| InstallState::new(Deployment::Docker, ControllerKind::Webui, &version, &ctx.source.key()));
+    let mut state = existing.clone().unwrap_or_else(|| InstallState::new(Deployment::Docker, controller, &version, &ctx.source.key()));
     state.begin(&ctx.layout, if existing.is_some() { "upgrade" } else { "install" }, &version)?;
     let had_env = env.dir.join(".env").exists() && existing.is_some();
     let result = (|| -> Result<()> {
         if had_env {
             std::fs::copy(env.dir.join(".env"), env.dir.join(".env.previous"))?;
         }
-        env.write_compose()?;
+        env.write_compose(webui)?;
         env.write_env(&images, &bind)?;
         if let Some(pw) = &password {
             env.write_secret(pw)?;
         }
         ctx.ui.section("启动容器");
         env.compose(&["up", "-d", "--remove-orphans"])?;
-        env.wait_healthy()?;
+        env.wait_healthy(webui)?;
+        // Core is healthy: switch the host CLI last.
+        if let (Some(staged), Some(v)) = (&cli_staged, &cli_version) {
+            commit_cli(ctx, staged, v)?;
+            point_cli(ctx, &env, v)?;
+        }
         Ok(())
     })();
+    if let Some(staged) = &cli_staged {
+        let _ = fsutil::remove_any(staged);
+    }
 
     if let Err(e) = result {
         ctx.ui.warn(&format!("{e:#}"));
         ctx.ui.section("回滚");
+        let prev_webui = existing.as_ref().is_none_or(|s| s.controller == ControllerKind::Webui);
         let restored = if had_env {
             std::fs::copy(env.dir.join(".env.previous"), env.dir.join(".env"))
                 .map_err(anyhow::Error::from)
+                .and_then(|_| env.write_compose(prev_webui))
                 .and_then(|_| env.compose(&["up", "-d", "--remove-orphans"]))
-                .and_then(|_| env.wait_healthy())
+                .and_then(|_| env.wait_healthy(prev_webui))
         } else if let Some(b) = &backup {
             let _ = env.compose(&["down"]);
             b.restore().and_then(|_| {
@@ -447,12 +596,19 @@ pub fn install(ctx: &Ctx, opts: DockerOptions) -> Result<()> {
                 s.record("upgrade", &version, false, Some(format!("{e:#}")));
                 s.save(&ctx.layout)?;
             }
-            None => fsutil::remove_any(&ctx.layout.state_file())?,
+            None => {
+                if cli {
+                    let _ = remove_cli(ctx);
+                }
+                fsutil::remove_any(&ctx.layout.state_file())?
+            }
         }
         return Err(e.context("Docker 部署失败，已撤销本次更改"));
     }
 
-    finish_secret(ctx, &env);
+    if webui {
+        finish_secret(ctx, &env);
+    }
     if let Some(prev) = &state.images
         && existing.is_some()
     {
@@ -461,16 +617,26 @@ pub fn install(ctx: &Ctx, opts: DockerOptions) -> Result<()> {
     }
     state.images = Some(images);
     state.version = version.clone();
+    state.controller = controller;
     state.source = ctx.source.key();
     state.legacy_backup = backup.as_ref().or(native_backup.as_ref()).map(|b| b.dir.clone()).or(state.legacy_backup.take());
     state.pending = None;
     state.record(if existing.is_some() { "upgrade" } else { "install" }, &version, true, None);
     state.save(&ctx.layout)?;
+    if cli {
+        prune_cli(ctx, &state);
+    } else if let Err(e) = remove_cli(ctx) {
+        ctx.ui.warn(&format!("移除命令行控制器失败：{e:#}"));
+    }
 
     ctx.ui.section("完成");
     ctx.ui.success(&format!("MSST-Net（{}，Docker）已就绪", label(&version)));
     ctx.ui.info(&format!("部署目录：{}", env.dir.display()));
-    ctx.ui.info(&format!("WebUI：https://<本机地址>:{}", bind.rsplit(':').next().unwrap_or("18080")));
+    if webui {
+        ctx.ui.info(&format!("WebUI：https://<本机地址>:{}", bind.rsplit(':').next().unwrap_or("18080")));
+    } else {
+        ctx.ui.info("命令行控制器：sudo msst-net-cli --help（Core 在容器中，只接受 root 的连接）");
+    }
     Ok(())
 }
 
@@ -504,33 +670,62 @@ pub fn repair(ctx: &Ctx, mut state: InstallState) -> Result<()> {
     let _lock = (!ctx.dry_run).then(|| Lock::acquire(&ctx.layout)).transpose()?;
     let env = Env::new(ctx)?;
     let images = state.images.clone().context("安装记录中没有镜像信息")?;
-    let steps = vec![
-        "重写 docker-compose.yml 与 .env（保留 ./data、./webui）".into(),
+    let webui = state.controller == ControllerKind::Webui;
+    let cli_version = (state.controller == ControllerKind::Cli)
+        .then(|| Versions::parse_id(&state.version).controller.context("安装记录中没有控制器版本"))
+        .transpose()?;
+    if cli_version.is_some() {
+        cli_entry::check_free(&ctx.layout)?;
+    }
+    let cli_broken = cli_version.as_deref().is_some_and(|v| !cli_intact(ctx, v));
+    let mut steps = vec![
+        format!("重写 docker-compose.yml 与 .env（保留 ./data{}）", if webui { "、./webui" } else { "" }),
         "缺失的镜像重新拉取".into(),
         "重建容器并做健康检查".into(),
     ];
+    if let Some(v) = &cli_version {
+        if cli_broken {
+            steps.push(format!("重新下载命令行控制器 {v}（文件缺失或损坏）"));
+        }
+        steps.push(format!("重建命令 msst-net-cli（{}）", ctx.layout.cli_entry().display()));
+    }
     if !ctx.ui.plan(&format!("修复 Docker 部署（{}）", label(&state.version)), &steps, ctx.dry_run)? {
         return Ok(());
     }
-    for img in [&images.core, &images.webui] {
+    for img in [&images.core].into_iter().chain(&images.webui) {
         if !cmd::succeeds("docker", &["image", "inspect", img]) {
             env.pull(img)?;
         }
     }
+    let cli_staged = match &cli_version {
+        Some(v) if cli_broken => Some(stage_cli(ctx, &ctx.resolve(Product::Controller, Some(v))?)?),
+        _ => None,
+    };
     let bind = env.read_bind();
-    env.write_compose()?;
+    env.write_compose(webui)?;
     env.write_env(&images, &bind)?;
-    if !env.has_password() && !env.secret_file().exists() {
+    if webui && !env.has_password() && !env.secret_file().exists() {
         let pw = ctx.ui.new_password("WebUI 尚未设置密码，请设置", "--admin-password-file")?;
         env.write_secret(&pw)?;
     }
     state.begin(&ctx.layout, "repair", &state.version.clone())?;
-    let result = env.compose(&["up", "-d", "--force-recreate", "--remove-orphans"]).and_then(|_| env.wait_healthy());
+    let result = env.compose(&["up", "-d", "--force-recreate", "--remove-orphans"]).and_then(|_| env.wait_healthy(webui)).and_then(|_| {
+        let Some(v) = &cli_version else { return Ok(()) };
+        if let Some(staged) = &cli_staged {
+            commit_cli(ctx, staged, v)?;
+        }
+        point_cli(ctx, &env, v)
+    });
+    if let Some(staged) = &cli_staged {
+        let _ = fsutil::remove_any(staged);
+    }
     state.pending = None;
     state.record("repair", &state.version.clone(), result.is_ok(), result.as_ref().err().map(|e| format!("{e:#}")));
     state.save(&ctx.layout)?;
     result?;
-    finish_secret(ctx, &env);
+    if webui {
+        finish_secret(ctx, &env);
+    }
     ctx.ui.success("修复完成");
     Ok(())
 }
@@ -539,12 +734,30 @@ pub fn rollback(ctx: &Ctx, mut state: InstallState) -> Result<()> {
     let _lock = (!ctx.dry_run).then(|| Lock::acquire(&ctx.layout)).transpose()?;
     let prev = state.previous_images.clone().context("没有可回滚的镜像版本")?;
     let prev_version = state.previous.clone().unwrap_or_else(|| "custom".into());
+    let webui = state.controller == ControllerKind::Webui;
+    if prev.webui.is_some() != webui {
+        bail!("上一版本使用的是另一种控制器，无法回滚；请用 install --controller 重新选择。");
+    }
+    let cli_version = if webui { None } else { Some(Versions::parse_id(&prev_version).controller.context("上一版本没有命令行控制器")?) };
+    if let Some(v) = &cli_version
+        && !cli_intact(ctx, v)
+    {
+        bail!("命令行控制器 {v} 的文件已损坏或缺失（{}），无法回滚", cli_exe(ctx, v).display());
+    }
     let env = Env::new(ctx)?;
-    let steps = vec![format!("切换到 {} / {}，重建容器并做健康检查；失败则切回 {}", prev.core, prev.webui, state.version)];
+    let images: Vec<&String> = [&prev.core].into_iter().chain(&prev.webui).collect();
+    let mut steps = vec![format!(
+        "切换到 {}，重建容器并做健康检查；失败则切回 {}",
+        images.iter().map(|i| i.as_str()).collect::<Vec<_>>().join(" / "),
+        state.version
+    )];
+    if let Some(v) = &cli_version {
+        steps.push(format!("命令 msst-net-cli 切换到 {}", cli_exe(ctx, v).display()));
+    }
     if !ctx.ui.plan(&format!("回滚到 {}", label(&prev_version)), &steps, ctx.dry_run)? {
         return Ok(());
     }
-    for img in [&prev.core, &prev.webui] {
+    for img in images {
         if !cmd::succeeds("docker", &["image", "inspect", img]) {
             env.pull(img)?;
         }
@@ -553,10 +766,13 @@ pub fn rollback(ctx: &Ctx, mut state: InstallState) -> Result<()> {
     let bind = env.read_bind();
     state.begin(&ctx.layout, "rollback", &prev_version)?;
     env.write_env(&prev, &bind)?;
-    let result = env.compose(&["up", "-d", "--remove-orphans"]).and_then(|_| env.wait_healthy());
+    let result = env
+        .compose(&["up", "-d", "--remove-orphans"])
+        .and_then(|_| env.wait_healthy(webui))
+        .and_then(|_| cli_version.as_deref().map_or(Ok(()), |v| point_cli(ctx, &env, v)));
     if let Err(e) = result {
         env.write_env(&current, &bind)?;
-        let back = env.compose(&["up", "-d", "--remove-orphans"]).and_then(|_| env.wait_healthy());
+        let back = env.compose(&["up", "-d", "--remove-orphans"]).and_then(|_| env.wait_healthy(webui));
         state.pending = None;
         state.record("rollback", &prev_version, false, Some(format!("{e:#}")));
         state.save(&ctx.layout)?;
@@ -578,6 +794,9 @@ pub fn uninstall(ctx: &Ctx, state: InstallState, purge: bool) -> Result<()> {
     let _lock = (!ctx.dry_run).then(|| Lock::acquire(&ctx.layout)).transpose()?;
     let dir = ctx.layout.docker_dir();
     let mut steps = vec!["停止并删除容器".to_string(), "删除 compose 文件、.env 与安装器保存的仓库凭据".into()];
+    if state.controller == ControllerKind::Cli || cli_entry::exists(&ctx.layout) {
+        steps.push(format!("删除命令 msst-net-cli（{}）与主机上的命令行控制器", ctx.layout.cli_entry().display()));
+    }
     if purge {
         steps.push(format!("删除 {}（含设备身份 ./data 与 WebUI 配置 ./webui）及镜像", dir.display()));
     } else {
@@ -601,6 +820,7 @@ pub fn uninstall(ctx: &Ctx, state: InstallState, purge: bool) -> Result<()> {
     for f in ["docker-compose.yml", ".env", ".env.previous", "secrets", ".docker", "run"] {
         fsutil::remove_any(&dir.join(f))?;
     }
+    remove_cli(ctx)?;
     fsutil::remove_any(&ctx.layout.state_file())?;
     if purge {
         fsutil::remove_any(&dir)?;
@@ -620,10 +840,12 @@ pub fn status(ctx: &Ctx, state: &InstallState) {
         return;
     };
     if let Some(i) = &state.images {
-        ctx.ui.info(&format!("镜像：{} / {}", i.core, i.webui));
+        ctx.ui.info(&format!("镜像：{}", [&i.core].into_iter().chain(&i.webui).map(String::as_str).collect::<Vec<_>>().join(" / ")));
     }
     ctx.ui.info(&format!("Core 容器：{}", env.container_status(CORE_CONTAINER)));
-    ctx.ui.info(&format!("WebUI 容器：{}", env.container_status(WEBUI_CONTAINER)));
+    if state.controller == ControllerKind::Webui {
+        ctx.ui.info(&format!("WebUI 容器：{}", env.container_status(WEBUI_CONTAINER)));
+    }
     ctx.ui.info(&format!("部署目录：{}", env.dir.display()));
 }
 
@@ -640,6 +862,10 @@ mod tests {
         assert!(COMPOSE.contains("- ./webui:/var/lib/msst-webui"));
         assert!(COMPOSE.contains("${MSST_CORE_IMAGE:?"));
         assert!(!COMPOSE.contains("ADMIN_PASSWORD"), "the password goes through a secret file, not the environment");
+        // Core only: the same Core service, no WebUI.
+        let core_service = |t: &str| t[t.find("  msst-net-core:").unwrap()..].split("\n\n").next().unwrap().trim_end().to_string();
+        assert_eq!(core_service(COMPOSE_CORE), core_service(COMPOSE));
+        assert!(!COMPOSE_CORE.contains("msst-net-ctrl-webui"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub const SCHEMA: u32 = 1;
 pub enum Deployment {
     /// Core (and the WebUI, if chosen) as system services.
     Native,
-    /// Core and the WebUI as containers (Linux).
+    /// Core (and the WebUI, if chosen) as containers (Linux).
     Docker,
 }
 
@@ -25,6 +25,9 @@ pub enum ControllerKind {
     /// Compose Desktop application (replaces the 3.0.x Tauri app).
     Desktop,
     Webui,
+    /// Command-line Controller `msst-net-cli` (run by users in a terminal;
+    /// on the host also when Core runs in Docker).
+    Cli,
     /// Core only (headless; manage it from another device's WebUI later).
     None,
 }
@@ -34,6 +37,7 @@ impl ControllerKind {
         match self {
             ControllerKind::Desktop => "桌面版（Compose Desktop）",
             ControllerKind::Webui => "WebUI",
+            ControllerKind::Cli => "命令行（msst-net-cli）",
             ControllerKind::None => "无（仅核心）",
         }
     }
