@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "msst-net-installer"
-version = "3.1.3"
+version = "3.1.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
