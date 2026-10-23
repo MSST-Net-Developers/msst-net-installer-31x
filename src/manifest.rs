@@ -149,20 +149,34 @@ impl Format {
 }
 
 impl Component {
+    /// The asset name prefix.  Every Controller asset starts with
+    /// `msst-net-controller-<type>-`.
     fn stem(self) -> &'static str {
         match self {
             Component::Core => "msst-net-core",
-            Component::Webui => "msst-net-webui",
+            Component::Webui => "msst-net-controller-webui",
             Component::Desktop => "msst-net-controller-desktop",
-            Component::Cli => "msst-net-cli",
+            Component::Cli => "msst-net-controller-cli",
             Component::Wintun => "wintun",
             Component::Unknown => "",
+        }
+    }
+
+    /// Earlier prefixes, still accepted when reading a release: Controller
+    /// 3.1.8 and older (rollback, `--controller-version`) name their
+    /// artifacts `msst-net-webui-…` / `msst-net-cli-…`.
+    fn legacy_stem(self) -> Option<&'static str> {
+        match self {
+            Component::Webui => Some("msst-net-webui"),
+            Component::Cli => Some("msst-net-cli"),
+            _ => None,
         }
     }
 }
 
 /// The release asset name for a component (the naming contract):
 /// `<stem>-<os>-<arch><ext>`, e.g. `msst-net-core-linux-x86_64`,
+/// `msst-net-controller-webui-linux-x86_64`,
 /// `msst-net-controller-desktop-windows-x86_64.msi`,
 /// `wintun-windows-aarch64.dll`.
 pub fn asset_name(component: Component, os: Os, arch: Arch, format: Format) -> String {
@@ -170,11 +184,18 @@ pub fn asset_name(component: Component, os: Os, arch: Arch, format: Format) -> S
 }
 
 /// Inverse of [`asset_name`]: classify a file in a release directory.
+/// Also accepts the earlier Controller names ([`Component::legacy_stem`]).
 pub fn parse_asset_name(name: &str) -> Option<(Component, Os, Arch, Format)> {
-    // Longest stem first ("msst-net-core" is not a prefix of the others, but
-    // keep the order explicit).
+    // No stem (current or legacy) is a prefix of another, so the order
+    // doesn't matter; keep it explicit anyway.
     for component in [Component::Desktop, Component::Webui, Component::Cli, Component::Core, Component::Wintun] {
-        let Some(rest) = name.strip_prefix(component.stem()).and_then(|r| r.strip_prefix('-')) else { continue };
+        let Some(rest) = [Some(component.stem()), component.legacy_stem()]
+            .into_iter()
+            .flatten()
+            .find_map(|stem| name.strip_prefix(stem).and_then(|r| r.strip_prefix('-')))
+        else {
+            continue;
+        };
         for os in [Os::Linux, Os::Windows, Os::Macos] {
             let Some(rest) = rest.strip_prefix(os.as_str()).and_then(|r| r.strip_prefix('-')) else { continue };
             for arch in [Arch::X86_64, Arch::Aarch64] {
@@ -452,7 +473,12 @@ pub mod tests {
             assert_eq!(parse_asset_name(&name), Some((c, os, arch, f)), "{name}");
         }
         assert_eq!(asset_name(Component::Core, Os::Windows, Arch::X86_64, Format::Binary), "msst-net-core-windows-x86_64.exe");
-        assert_eq!(asset_name(Component::Cli, Os::Macos, Arch::Aarch64, Format::Binary), "msst-net-cli-macos-aarch64");
+        assert_eq!(asset_name(Component::Cli, Os::Macos, Arch::Aarch64, Format::Binary), "msst-net-controller-cli-macos-aarch64");
+        assert_eq!(asset_name(Component::Webui, Os::Windows, Arch::X86_64, Format::Binary), "msst-net-controller-webui-windows-x86_64.exe");
+        // Controller 3.1.8 and older.
+        assert_eq!(parse_asset_name("msst-net-webui-linux-x86_64"), Some((Component::Webui, Os::Linux, Arch::X86_64, Format::Binary)));
+        assert_eq!(parse_asset_name("msst-net-cli-windows-aarch64.exe"), Some((Component::Cli, Os::Windows, Arch::Aarch64, Format::Binary)));
+        assert_eq!(parse_asset_name("msst-net-controller-cli-linux-x86_64.deb"), None);
         assert_eq!(parse_asset_name("msst-net-core-linux-x86_64.exe"), None);
         assert_eq!(parse_asset_name("msst-net-client-core-linux-x86_64"), None, "3.0.x names are not 3.1 artifacts");
         assert_eq!(parse_asset_name("manifest.json"), None);
@@ -508,9 +534,12 @@ pub mod tests {
 
         let mut m = sample("3.1.0");
         m.product = Product::Controller;
-        m.artifacts[0].name = "msst-net-cli-linux-x86_64".into();
+        m.artifacts[0].name = "msst-net-controller-cli-linux-x86_64".into();
         m.artifacts[0].component = Component::Cli;
         assert!(verify(Product::Controller, &serde_json::to_vec(&m).unwrap(), None, &lax).is_ok(), "the Controller ships the CLI");
+        let mut old = m.clone();
+        old.artifacts[0].name = "msst-net-cli-linux-x86_64".into();
+        assert!(verify(Product::Controller, &serde_json::to_vec(&old).unwrap(), None, &lax).is_ok(), "3.1.8-style names still verify");
         m.product = Product::Core;
         assert!(check(&m).is_err(), "Core doesn't ship the CLI");
         let mut m = sample("3.1.0");

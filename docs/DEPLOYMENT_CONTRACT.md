@@ -58,13 +58,18 @@ Tag 为 `v<版本>`。每个 Release 只包含本仓库的产物与本仓库的�
 | 组件 | 文件 | 来源 |
 |---|---|---|
 | Core（core 仓库） | `msst-net-core-<os>-<arch>[.exe]` | core 仓库 `cargo build --release --bin msst-net-core` |
-| WebUI（controller 仓库） | `msst-net-webui-<os>-<arch>[.exe]` | controller 仓库 `--features webui --bin msst-net-webui`（先构建 wasm 前端） |
-| 命令行控制器（controller 仓库） | `msst-net-cli-<os>-<arch>[.exe]` | controller 仓库 `cargo build --release --bin msst-net-cli`（六个平台；Linux 为 musl 静态链接） |
+| WebUI（controller 仓库） | `msst-net-controller-webui-<os>-<arch>[.exe]` | controller 仓库 `--features webui --bin msst-net-webui`（先构建 wasm 前端） |
+| 命令行控制器（controller 仓库） | `msst-net-controller-cli-<os>-<arch>[.exe]` | controller 仓库 `cargo build --release --bin msst-net-cli`（六个平台；Linux 为 musl 静态链接） |
 | 桌面控制器（controller 仓库） | `msst-net-controller-desktop-linux-<arch>.deb` / `.rpm` / `.tar.gz` | `packageReleaseDeb` / `packageReleaseRpm` / `createReleaseDistributable` 打包为 tar.gz |
 | | `msst-net-controller-desktop-windows-<arch>.msi` | `packageReleaseMsi` |
 | | `msst-net-controller-desktop-macos-<arch>.dmg` | `packageReleaseDmg`（**当前 build.gradle.kts 未配置**） |
 | Wintun（可选，core 仓库） | `wintun-windows-<arch>.dll` | 未提供时安装器从 wintun.net 下载 0.14.1（固定 SHA-256） |
 | 清单（两个仓库各一份） | `manifest.json`、`manifest.json.sig` | `msst-net-installer release manifest/sign` |
+
+控制器仓库的文件统一以 `msst-net-controller-<type>-` 开头（`type` ∈ `webui` `cli`
+`desktop` `android`；Android APK 不进清单）。控制器 3.1.8 及更早的 Release 使用旧名称
+`msst-net-webui-…` / `msst-net-cli-…`，安装器读取时仍然接受（回滚、`--controller-version`）。
+安装后的可执行文件、服务与命令名称不变：`msst-net-webui`、`msst-net-cli`。
 
 不符合命名的文件不会进入清单，安装器也不会使用。3.0.x 的
 `msst-net-client-*` 文件名与 3.1 不冲突，3.0.x 安装器遇到 3.1 发布会因找不到
@@ -81,7 +86,7 @@ Tag 为 `v<版本>`。每个 Release 只包含本仓库的产物与本仓库的�
   "min_core": "3.1.0",
   "min_installer": "3.1.0",
   "artifacts": [
-    { "name": "msst-net-webui-linux-x86_64", "component": "webui", "os": "linux",
+    { "name": "msst-net-controller-webui-linux-x86_64", "component": "webui", "os": "linux",
       "arch": "x86_64", "format": "binary", "size": 9437184, "sha256": "…" }
   ],
   "image": "abjust/msstnet31x-webui:3.1.0@sha256:…"
@@ -92,8 +97,9 @@ Tag 为 `v<版本>`。每个 Release 只包含本仓库的产物与本仓库的�
   控制器清单只能列 webui/desktop/cli（cli 的 `format` 只能是 `binary`）。用一个仓库的
   签名清单冒充另一个仓库的会被拒绝。
 - 安装器不认识的 `component`（以后新增的组件）会被跳过，不会让整份清单失败。
-  3.1.4 之前的安装器会拒绝含 `cli` 的清单，所以列出 `cli` 的控制器 Release 应把
-  `min_installer` 设为 `3.1.4` 或更新。
+  3.1.4 之前的安装器既不认识 `cli`，也不认识 `msst-net-controller-webui|cli-…` 这样的新名称，
+  所以使用新名称或列出 `cli` 的控制器 Release 应把 `min_installer` 设为 `3.1.4` 或更新；
+  生成清单所用的安装器也必须是 3.1.4 或更新，否则新名称的文件会被当作不符合命名约定而跳过。
 - `min_core`（仅控制器）：所需的最低 Core 版本，不满足时安装器拒绝。
   `ipc_protocol` 两边不同时只给出警告。
 - `image`：本发布的容器镜像，可省略；默认 `abjust/msstnet31x-core:<Core 版本>`
